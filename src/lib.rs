@@ -32,11 +32,14 @@ mod server;
 mod utils;
 
 pub use backend::{
-    DirEntry, FileInfo, Handle, OpenIntent, OpenOptions, RangeLock, RangeLockAction, ShareBackend,
+    BackendCapabilities, DirEntry, FileInfo, FileTimes, Handle, OpenIntent, OpenOptions, RangeLock,
+    RangeLockAction, ShareBackend,
 };
 pub use builder::{Access, Share};
+pub use error::{SmbError, SmbResult};
 #[cfg(feature = "localfs")]
 pub use fs::LocalFsBackend;
+pub use path::SmbPath;
 pub use proto::auth::ntlm::Identity;
 pub use server::{ConfigHandle, ShareMode, ShutdownHandle, SmbServer};
 
