@@ -1,11 +1,12 @@
-//! Byte-range locks for the local backend. The registry is process-wide so
-//! different shares of the same inode cannot grant conflicting locks. Other
-//! backends must supply their own authority for cross-machine locking.
+//! Local byte-range locks and SMB share modes. Each inode has its own
+//! read/write guard: nonconflicting I/O can run concurrently, while granting
+//! a lock waits for in-flight I/O to finish its conflict check and operation.
+//! Other backends need their own authority for cross-machine coordination.
 
 use std::collections::HashMap;
 use std::io;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock, Weak};
 
 use crate::backend::{RangeLock, RangeLockAction};
 use crate::error::{SmbError, SmbResult};
@@ -31,27 +32,42 @@ struct OpenRecord {
     share: u32,
 }
 
-static NEXT_OWNER: AtomicU64 = AtomicU64::new(1);
-static REGISTRY: OnceLock<Mutex<HashMap<FileKey, Vec<HeldLock>>>> = OnceLock::new();
-static OPENS: OnceLock<Mutex<HashMap<FileKey, Vec<OpenRecord>>>> = OnceLock::new();
+#[derive(Default)]
+struct FileState {
+    locks: Vec<HeldLock>,
+    opens: Vec<OpenRecord>,
+}
 
-fn registry() -> &'static Mutex<HashMap<FileKey, Vec<HeldLock>>> {
+type SharedState = Arc<RwLock<FileState>>;
+static NEXT_OWNER: AtomicU64 = AtomicU64::new(1);
+static REGISTRY: OnceLock<Mutex<HashMap<FileKey, Weak<RwLock<FileState>>>>> = OnceLock::new();
+
+fn registry() -> &'static Mutex<HashMap<FileKey, Weak<RwLock<FileState>>>> {
     REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-fn open_registry() -> &'static Mutex<HashMap<FileKey, Vec<OpenRecord>>> {
-    OPENS.get_or_init(|| Mutex::new(HashMap::new()))
+fn state_for(key: FileKey) -> SharedState {
+    let mut registry = registry()
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    if let Some(state) = registry.get(&key).and_then(Weak::upgrade) {
+        return state;
+    }
+    let state = Arc::new(RwLock::new(FileState::default()));
+    registry.insert(key, Arc::downgrade(&state));
+    state
 }
 
 fn overlaps(start: u64, end: u64, held: &HeldLock) -> bool {
     start < held.end && held.start < end
 }
 
-/// A unique SMB CREATE handle owns its locks until CLOSE or disconnect drops
-/// the handle. In-flight reads retain the owner while their blocking I/O runs.
+/// A unique SMB CREATE handle owns its locks and share mode until CLOSE or
+/// disconnect drops the handle. Blocking I/O holds a clone of this owner.
 pub(super) struct LockOwner {
     id: u64,
     key: FileKey,
+    state: SharedState,
 }
 
 impl LockOwner {
@@ -64,29 +80,31 @@ impl LockOwner {
     ) -> SmbResult<Self> {
         let desired = u32::from(read) | (u32::from(write) << 1) | (u32::from(delete) << 2);
         let id = NEXT_OWNER.fetch_add(1, Ordering::Relaxed);
-        let mut opens = open_registry()
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
-        let records = opens.entry(key).or_default();
-        if records
-            .iter()
-            .any(|record| desired & !record.share != 0 || record.desired & !share != 0)
+        let state = state_for(key);
         {
-            return Err(SmbError::Sharing);
+            let mut guard = state.write().unwrap_or_else(|poison| poison.into_inner());
+            if guard
+                .opens
+                .iter()
+                .any(|record| desired & !record.share != 0 || record.desired & !share != 0)
+            {
+                return Err(SmbError::Sharing);
+            }
+            guard.opens.push(OpenRecord {
+                owner: id,
+                desired,
+                share,
+            });
         }
-        records.push(OpenRecord {
-            owner: id,
-            desired,
-            share,
-        });
-        Ok(Self { id, key })
+        Ok(Self { id, key, state })
     }
 
     pub(super) fn apply(&self, operations: &[RangeLock]) -> SmbResult<()> {
-        let mut table = registry()
-            .lock()
+        let mut guard = self
+            .state
+            .write()
             .unwrap_or_else(|poison| poison.into_inner());
-        let mut proposed = table.get(&self.key).cloned().unwrap_or_default();
+        let mut proposed = guard.locks.clone();
         for operation in operations {
             let end = operation
                 .offset
@@ -122,16 +140,10 @@ impl LockOwner {
                 }
             }
         }
-        if proposed.is_empty() {
-            table.remove(&self.key);
-        } else {
-            table.insert(self.key, proposed);
-        }
+        guard.locks = proposed;
         Ok(())
     }
 
-    /// Keep the registry locked through I/O so a competing lock cannot be
-    /// granted between the conflict check and the actual read or write.
     pub(super) fn with_access<T>(
         &self,
         offset: u64,
@@ -140,13 +152,12 @@ impl LockOwner {
         operation: impl FnOnce() -> io::Result<T>,
     ) -> SmbResult<T> {
         let end = offset.checked_add(length).ok_or(SmbError::NameInvalid)?;
-        let table = registry()
-            .lock()
+        let guard = self
+            .state
+            .read()
             .unwrap_or_else(|poison| poison.into_inner());
-        if table.get(&self.key).is_some_and(|held| {
-            held.iter().any(|held| {
-                held.owner != self.id && overlaps(offset, end, held) && (write || held.exclusive)
-            })
+        if guard.locks.iter().any(|held| {
+            held.owner != self.id && overlaps(offset, end, held) && (write || held.exclusive)
         }) {
             return Err(SmbError::LockConflict);
         }
@@ -156,24 +167,19 @@ impl LockOwner {
 
 impl Drop for LockOwner {
     fn drop(&mut self) {
-        let mut table = registry()
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
-        if let Some(held) = table.get_mut(&self.key) {
-            held.retain(|lock| lock.owner != self.id);
-            if held.is_empty() {
-                table.remove(&self.key);
-            }
+        {
+            let mut guard = self
+                .state
+                .write()
+                .unwrap_or_else(|poison| poison.into_inner());
+            guard.locks.retain(|lock| lock.owner != self.id);
+            guard.opens.retain(|record| record.owner != self.id);
         }
-        drop(table);
-        let mut opens = open_registry()
+        let mut registry = registry()
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
-        if let Some(records) = opens.get_mut(&self.key) {
-            records.retain(|record| record.owner != self.id);
-            if records.is_empty() {
-                opens.remove(&self.key);
-            }
+        if Arc::strong_count(&self.state) == 1 {
+            registry.remove(&self.key);
         }
     }
 }
