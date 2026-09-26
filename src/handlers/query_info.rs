@@ -102,20 +102,23 @@ pub async fn handle(
             }
         }
         InfoType::FileSystem => {
-            // For FS info we use the open's tree's backend for context.
+            let backend = {
+                let tree = tree_arc.read().await;
+                tree.share.backend.clone()
+            };
+            let volume = match backend.volume_info().await {
+                Ok(value) => value,
+                Err(error) => return HandlerResponse::err(error.to_nt_status()),
+            };
+            let total_units = (volume.total_bytes / 4096).max(1);
+            let free_units = (volume.available_bytes / 4096).min(total_units);
             let creation_time = info_res.as_ref().map(|i| i.creation_time).unwrap_or(0);
             match req.file_information_class {
                 ic::FS_VOLUME_INFORMATION => {
-                    ic::encode_fs_volume_information(creation_time, 0xCAFE_BABE, "smb-server")
+                    ic::encode_fs_volume_information(creation_time, 0xCAFE_BABE, &volume.label)
                 }
                 ic::FS_SIZE_INFORMATION => {
-                    // 1 PiB free pseudo-volume, 4 KiB cluster.
-                    ic::encode_fs_size_information(
-                        1u64 << 40, // total
-                        1u64 << 39, // free
-                        1,          // sectors per cluster
-                        4096,       // bytes per sector
-                    )
+                    ic::encode_fs_size_information(total_units, free_units, 1, 4096)
                 }
                 ic::FS_DEVICE_INFORMATION => {
                     ic::encode_fs_device_information(FILE_DEVICE_DISK, FILE_REMOTE_DEVICE)
@@ -141,9 +144,13 @@ pub async fn handle(
                         "NTFS",
                     )
                 }
-                ic::FS_FULL_SIZE_INFORMATION => {
-                    ic::encode_fs_full_size_information(1u64 << 40, 1u64 << 39, 1u64 << 39, 1, 4096)
-                }
+                ic::FS_FULL_SIZE_INFORMATION => ic::encode_fs_full_size_information(
+                    total_units,
+                    free_units,
+                    free_units,
+                    1,
+                    4096,
+                ),
                 _ => return HandlerResponse::err(ntstatus::STATUS_INVALID_INFO_CLASS),
             }
         }

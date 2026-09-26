@@ -139,6 +139,14 @@ pub struct StreamInfo {
     pub allocation_size: u64,
 }
 
+/// Filesystem capacity presented to clients as 4 KiB allocation units.
+#[derive(Debug, Clone)]
+pub struct VolumeInfo {
+    pub total_bytes: u64,
+    pub available_bytes: u64,
+    pub label: String,
+}
+
 /// FILE_NOTIFY_INFORMATION event relative to the watched directory.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChangeEvent {
@@ -238,6 +246,15 @@ pub trait ShareBackend: Send + Sync + 'static {
         _completion_filter: u32,
     ) -> SmbResult<Vec<ChangeEvent>> {
         Err(SmbError::NotSupported)
+    }
+
+    /// Backends with a real storage pool override the generic test volume.
+    async fn volume_info(&self) -> SmbResult<VolumeInfo> {
+        Ok(VolumeInfo {
+            total_bytes: 1u64 << 52,
+            available_bytes: 1u64 << 51,
+            label: "smb-server".to_owned(),
+        })
     }
 
     /// Static capabilities. The dispatcher consults these at TREE_CONNECT and

@@ -33,7 +33,7 @@ mod utils;
 
 pub use backend::{
     BackendCapabilities, ChangeEvent, DirEntry, FileInfo, FileTimes, Handle, OpenIntent,
-    OpenOptions, RangeLock, RangeLockAction, ShareBackend, StreamInfo,
+    OpenOptions, RangeLock, RangeLockAction, ShareBackend, StreamInfo, VolumeInfo,
 };
 pub use builder::{Access, Share};
 pub use error::{SmbError, SmbResult};
