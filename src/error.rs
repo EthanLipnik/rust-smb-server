@@ -31,8 +31,10 @@ pub enum SmbError {
     NameInvalid,
     #[error("sharing violation")]
     Sharing,
-    #[error("byte-range lock conflict")]
+    #[error("file I/O conflicts with a byte-range lock")]
     LockConflict,
+    #[error("byte-range lock not granted")]
+    LockNotGranted,
     #[error("not supported")]
     NotSupported,
     #[error("io: {0}")]
@@ -52,7 +54,8 @@ impl SmbError {
             SmbError::NotADirectory => ntstatus::STATUS_NOT_A_DIRECTORY,
             SmbError::NameInvalid => ntstatus::STATUS_OBJECT_NAME_INVALID,
             SmbError::Sharing => ntstatus::STATUS_SHARING_VIOLATION,
-            SmbError::LockConflict => ntstatus::STATUS_LOCK_NOT_GRANTED,
+            SmbError::LockConflict => ntstatus::STATUS_FILE_LOCK_CONFLICT,
+            SmbError::LockNotGranted => ntstatus::STATUS_LOCK_NOT_GRANTED,
             SmbError::NotSupported => ntstatus::STATUS_NOT_SUPPORTED,
             SmbError::Io(_) => ntstatus::STATUS_UNEXPECTED_IO_ERROR,
         }

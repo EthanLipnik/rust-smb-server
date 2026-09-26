@@ -100,7 +100,7 @@ impl LockOwner {
                     let Some(index) = proposed.iter().position(|held| {
                         held.owner == self.id && held.start == operation.offset && held.end == end
                     }) else {
-                        return Err(SmbError::LockConflict);
+                        return Err(SmbError::LockNotGranted);
                     };
                     proposed.remove(index);
                 }
@@ -111,7 +111,7 @@ impl LockOwner {
                             && overlaps(operation.offset, end, held)
                             && (exclusive || held.exclusive)
                     }) {
-                        return Err(SmbError::LockConflict);
+                        return Err(SmbError::LockNotGranted);
                     }
                     proposed.push(HeldLock {
                         owner: self.id,

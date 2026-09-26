@@ -159,7 +159,7 @@ async fn exclusive_ranges_conflict_and_close_releases_them() {
         parse_response_header(&read_frame(&mut stream).await)
             .0
             .channel_sequence_status,
-        0xC000_0055,
+        0xC000_0054,
         "a conflicting lock must also block reads"
     );
 
@@ -188,7 +188,7 @@ async fn exclusive_ranges_conflict_and_close_releases_them() {
         parse_response_header(&read_frame(&mut stream).await)
             .0
             .channel_sequence_status,
-        0xC000_0055,
+        0xC000_0054,
         "a conflicting lock must also block writes"
     );
 
