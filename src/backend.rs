@@ -131,6 +131,23 @@ pub struct DirEntry {
     pub info: FileInfo,
 }
 
+/// One named alternate data stream on a file. The name excludes `:$DATA`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StreamInfo {
+    pub name: String,
+    pub size: u64,
+    pub allocation_size: u64,
+}
+
+/// FILE_NOTIFY_INFORMATION event relative to the watched directory.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChangeEvent {
+    /// SMB FILE_ACTION_ADDED (1), REMOVED (2), MODIFIED (3),
+    /// RENAMED_OLD_NAME (4), or RENAMED_NEW_NAME (5).
+    pub action: u32,
+    pub file_name: String,
+}
+
 /// Optional FILETIME values for `set_times`. `None` means "leave unchanged".
 #[derive(Debug, Clone, Copy, Default)]
 pub struct FileTimes {
@@ -168,6 +185,8 @@ pub struct BackendCapabilities {
     pub is_read_only: bool,
     /// True iff the backend treats names case-sensitively.
     pub case_sensitive: bool,
+    /// Named `:$DATA` streams can be opened, listed, and removed.
+    pub supports_named_streams: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -187,8 +206,39 @@ pub trait ShareBackend: Send + Sync + 'static {
     /// recursively delete.
     async fn unlink(&self, path: &SmbPath) -> SmbResult<()>;
 
-    /// Rename `from` to `to`. The backend must reject if `to` already exists.
-    async fn rename(&self, from: &SmbPath, to: &SmbPath) -> SmbResult<()>;
+    /// Rename atomically. When replacement is false, reject an existing target.
+    async fn rename(&self, from: &SmbPath, to: &SmbPath, replace_if_exists: bool) -> SmbResult<()>;
+
+    /// Open a named alternate data stream belonging to `path`.
+    async fn open_stream(
+        &self,
+        _path: &SmbPath,
+        _name: &str,
+        _opts: OpenOptions,
+    ) -> SmbResult<Box<dyn Handle>> {
+        Err(SmbError::NotSupported)
+    }
+
+    /// Enumerate named streams. An empty list means only the default stream exists.
+    async fn list_streams(&self, _path: &SmbPath) -> SmbResult<Vec<StreamInfo>> {
+        Err(SmbError::NotSupported)
+    }
+
+    /// Remove a named stream without removing its owning file.
+    async fn unlink_stream(&self, _path: &SmbPath, _name: &str) -> SmbResult<()> {
+        Err(SmbError::NotSupported)
+    }
+
+    /// Wait for changes under a directory. `file_name` values in the result
+    /// are relative to `path` and use backslash separators.
+    async fn watch_changes(
+        &self,
+        _path: &SmbPath,
+        _watch_tree: bool,
+        _completion_filter: u32,
+    ) -> SmbResult<Vec<ChangeEvent>> {
+        Err(SmbError::NotSupported)
+    }
 
     /// Static capabilities. The dispatcher consults these at TREE_CONNECT and
     /// uses `is_read_only` to clamp authz.
@@ -201,6 +251,12 @@ pub trait ShareBackend: Send + Sync + 'static {
 /// session goes away.
 #[async_trait]
 pub trait Handle: Send + Sync {
+    /// Set or clear delete-pending on this open. Implementations coordinate
+    /// all opens of the same file and delete after the final close. A backend
+    /// without that authority must reject the request.
+    async fn set_delete_on_close(&self, _delete: bool) -> SmbResult<()> {
+        Err(SmbError::NotSupported)
+    }
     /// Unsupported backends fail closed so the server never acknowledges
     /// byte-range protection it cannot enforce.
     async fn lock_ranges(&self, _operations: &[RangeLock]) -> SmbResult<()> {
@@ -253,13 +309,19 @@ impl ShareBackend for NotSupportedBackend {
     async fn unlink(&self, _path: &SmbPath) -> SmbResult<()> {
         Err(SmbError::NotSupported)
     }
-    async fn rename(&self, _from: &SmbPath, _to: &SmbPath) -> SmbResult<()> {
+    async fn rename(
+        &self,
+        _from: &SmbPath,
+        _to: &SmbPath,
+        _replace_if_exists: bool,
+    ) -> SmbResult<()> {
         Err(SmbError::NotSupported)
     }
     fn capabilities(&self) -> BackendCapabilities {
         BackendCapabilities {
             is_read_only: true,
             case_sensitive: false,
+            supports_named_streams: false,
         }
     }
 }

@@ -354,7 +354,9 @@ impl ShareBackend for LocalFsBackend {
         let mut cap_opts = CapOpenOptions::new();
         match opts.intent {
             OpenIntent::Open => {
-                cap_opts.read(true).write(opts.write);
+                cap_opts
+                    .read(opts.read || (!opts.write && opts.delete))
+                    .write(opts.write);
             }
             OpenIntent::Create => {
                 cap_opts.read(opts.read).write(true).create_new(true);
@@ -419,15 +421,10 @@ impl ShareBackend for LocalFsBackend {
         let root = Arc::clone(&self.root);
 
         spawn_blocking(move || -> io::Result<()> {
-            match root.remove_file(&rel) {
-                Ok(()) => Ok(()),
-                Err(e) if e.kind() == io::ErrorKind::IsADirectory => {
-                    // Caller's intent was "delete this name"; if it turned
-                    // out to be a directory, fall back to remove_dir which
-                    // refuses non-empty dirs (mapped to NotEmpty above).
-                    root.remove_dir(&rel)
-                }
-                Err(e) => Err(e),
+            if root.metadata(&rel)?.is_dir() {
+                root.remove_dir(&rel)
+            } else {
+                root.remove_file(&rel)
             }
         })
         .await
@@ -436,7 +433,21 @@ impl ShareBackend for LocalFsBackend {
         .map_err(io_to_smb)
     }
 
-    async fn rename(&self, from: &SmbPath, to: &SmbPath) -> SmbResult<()> {
+    async fn list_streams(&self, path: &SmbPath) -> SmbResult<Vec<crate::backend::StreamInfo>> {
+        let rel = to_rel_path(path);
+        let root = Arc::clone(&self.root);
+        let metadata = spawn_blocking(move || root.metadata(&rel))
+            .await
+            .map_err(join_to_io)
+            .map_err(io_to_smb)?
+            .map_err(io_to_smb)?;
+        if metadata.is_dir() {
+            return Ok(Vec::new());
+        }
+        Ok(Vec::new())
+    }
+
+    async fn rename(&self, from: &SmbPath, to: &SmbPath, replace_if_exists: bool) -> SmbResult<()> {
         if self.read_only {
             return Err(SmbError::AccessDenied);
         }
@@ -449,9 +460,7 @@ impl ShareBackend for LocalFsBackend {
         let root2 = Arc::clone(&self.root);
 
         spawn_blocking(move || -> io::Result<()> {
-            // Reject overwrite — SMB rename semantics require explicit
-            // replace-if-exists which we do not implement in v1.
-            if root2.exists(&to_path) {
+            if !replace_if_exists && root2.exists(&to_path) {
                 return Err(io::Error::from(io::ErrorKind::AlreadyExists));
             }
             root.rename(&from, &root2, &to_path)
@@ -468,6 +477,7 @@ impl ShareBackend for LocalFsBackend {
             // POSIX filesystems are typically case-sensitive. We don't try to
             // emulate case-insensitive lookup in v1 (see spec §3.4).
             case_sensitive: cfg!(any(target_os = "linux", target_os = "freebsd")),
+            supports_named_streams: false,
         }
     }
 }
@@ -620,6 +630,9 @@ impl Handle for LocalHandle {
                 if *read_only {
                     return Err(SmbError::AccessDenied);
                 }
+                if times.creation_time.is_some() || times.change_time.is_some() {
+                    return Err(SmbError::NotSupported);
+                }
                 let file = Arc::clone(file);
                 spawn_blocking(move || -> io::Result<()> {
                     let mut std_times = std::fs::FileTimes::new();
@@ -633,8 +646,6 @@ impl Handle for LocalHandle {
                     {
                         std_times = std_times.set_accessed(t);
                     }
-                    // creation_time / change_time: stable std::fs::FileTimes
-                    // does not expose setters for these; silently ignored.
                     file.set_times(std_times)
                 })
                 .await
@@ -916,7 +927,10 @@ mod tests {
         h.write(0, b"data").await.unwrap();
         h.close().await.unwrap();
 
-        backend.rename(&p("old.txt"), &p("new.txt")).await.unwrap();
+        backend
+            .rename(&p("old.txt"), &p("new.txt"), false)
+            .await
+            .unwrap();
         assert!(td.path().join("new.txt").exists());
         assert!(!td.path().join("old.txt").exists());
 
@@ -924,11 +938,25 @@ mod tests {
         let h = backend.open(&p("other.txt"), opts_create()).await.unwrap();
         h.close().await.unwrap();
         let err = backend
-            .rename(&p("other.txt"), &p("new.txt"))
+            .rename(&p("other.txt"), &p("new.txt"), false)
             .await
             .err()
             .unwrap();
         assert!(matches!(err, SmbError::Exists), "got {err:?}");
+    }
+
+    #[tokio::test]
+    async fn rename_replaces_existing_file_when_requested() {
+        let td = tempdir().unwrap();
+        let backend = LocalFsBackend::new(td.path()).unwrap();
+        std::fs::write(td.path().join("source"), b"new").unwrap();
+        std::fs::write(td.path().join("target"), b"old").unwrap();
+        backend
+            .rename(&p("source"), &p("target"), true)
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read(td.path().join("target")).unwrap(), b"new");
+        assert!(!td.path().join("source").exists());
     }
 
     #[tokio::test]

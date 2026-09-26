@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use crate::proto::header::Smb2Header;
-use crate::proto::messages::{CreateRequest, CreateResponse};
+use crate::proto::messages::{CreateContext, CreateRequest, CreateResponse};
 use tracing::{debug, warn};
 
 use crate::backend::{OpenIntent, OpenOptions};
@@ -68,12 +68,54 @@ pub async fn handle(
     let backend = tree.share.backend.clone();
     drop(tree);
 
+    let contexts = match CreateContext::parse_chain(&req.create_contexts) {
+        Ok(contexts) => contexts,
+        Err(_) => return HandlerResponse::err(ntstatus::STATUS_INVALID_PARAMETER),
+    };
+    let mut response_contexts = Vec::new();
+    for context in contexts {
+        if context.name == b"AAPL" {
+            if context.data.len() != 24
+                || u32::from_le_bytes(context.data[0..4].try_into().unwrap()) != 1
+            {
+                return HandlerResponse::err(ntstatus::STATUS_INVALID_PARAMETER);
+            }
+            let requested = u64::from_le_bytes(context.data[8..16].try_into().unwrap());
+            let supported = requested & 0x7;
+            let mut data = Vec::new();
+            data.extend_from_slice(&1u32.to_le_bytes()); // SERVER_QUERY
+            data.extend_from_slice(&0u32.to_le_bytes());
+            data.extend_from_slice(&supported.to_le_bytes());
+            if supported & 1 != 0 {
+                data.extend_from_slice(&0u64.to_le_bytes()); // no enhanced directory attributes
+            }
+            if supported & 2 != 0 {
+                let case_sensitive = if backend.capabilities().case_sensitive {
+                    2u64
+                } else {
+                    0
+                };
+                data.extend_from_slice(&case_sensitive.to_le_bytes());
+            }
+            if supported & 4 != 0 {
+                let model: Vec<u8> = "Mirage".encode_utf16().flat_map(u16::to_le_bytes).collect();
+                data.extend_from_slice(&0u32.to_le_bytes());
+                data.extend_from_slice(&(model.len() as u32).to_le_bytes());
+                data.extend_from_slice(&model);
+            }
+            response_contexts.push(CreateContext {
+                name: b"AAPL".to_vec(),
+                data,
+            });
+        }
+    }
+
     // Decode path.
     let units = match utf16le_to_units(&req.name) {
         Some(u) => u,
         None => return HandlerResponse::err(ntstatus::STATUS_OBJECT_NAME_INVALID),
     };
-    let path = match SmbPath::from_utf16(&units) {
+    let (path, stream_name) = match SmbPath::from_utf16_with_stream(&units) {
         Ok(p) => p,
         Err(_) => return HandlerResponse::err(ntstatus::STATUS_OBJECT_NAME_INVALID),
     };
@@ -125,6 +167,9 @@ pub async fn handle(
     if directory && non_directory {
         return HandlerResponse::err(ntstatus::STATUS_INVALID_PARAMETER);
     }
+    if stream_name.is_some() && directory {
+        return HandlerResponse::err(ntstatus::STATUS_INVALID_PARAMETER);
+    }
     let delete_on_close = req.create_options & FILE_DELETE_ON_CLOSE != 0;
     if delete_on_close && !want_delete {
         return HandlerResponse::err(ntstatus::STATUS_ACCESS_DENIED);
@@ -141,13 +186,23 @@ pub async fn handle(
         delete_on_close,
     };
 
-    let handle = match backend.open(&path, opts).await {
+    let open_result = match &stream_name {
+        Some(name) => backend.open_stream(&path, name, opts).await,
+        None => backend.open(&path, opts).await,
+    };
+    let handle = match open_result {
         Ok(h) => h,
         Err(e) => {
             debug!(error = %e, path = %path, "backend open failed");
             return HandlerResponse::err(e.to_nt_status());
         }
     };
+    if delete_on_close {
+        if let Err(e) = handle.set_delete_on_close(true).await {
+            let _ = handle.close().await;
+            return HandlerResponse::err(e.to_nt_status());
+        }
+    }
 
     // Stat for the response.
     let info = match handle.stat().await {
@@ -170,6 +225,8 @@ pub async fn handle(
             Access::Read
         },
         path,
+        stream_name,
+        want_delete,
         info.is_directory,
         delete_on_close,
     );
@@ -182,6 +239,8 @@ pub async fn handle(
         OpenIntent::OpenOrCreate | OpenIntent::OverwriteOrCreate => FILE_OPENED,
         OpenIntent::Open | OpenIntent::Truncate => FILE_OPENED,
     };
+    let mut context_bytes = Vec::new();
+    CreateContext::encode_chain(&response_contexts, &mut context_bytes).expect("encode contexts");
     let resp = CreateResponse {
         structure_size: 89,
         oplock_level: 0,
@@ -196,9 +255,9 @@ pub async fn handle(
         file_attributes: info.attributes(),
         reserved2: 0,
         file_id,
-        create_contexts_offset: 0,
-        create_contexts_length: 0,
-        create_contexts: vec![],
+        create_contexts_offset: if context_bytes.is_empty() { 0 } else { 152 },
+        create_contexts_length: context_bytes.len() as u32,
+        create_contexts: context_bytes,
     };
     let mut buf = Vec::new();
     resp.write_to(&mut buf).expect("encode");

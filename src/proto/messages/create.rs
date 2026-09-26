@@ -88,7 +88,35 @@ impl CreateRequest {
     }
 
     pub fn parse(buf: &[u8]) -> ProtoResult<Self> {
-        Ok(Self::read(&mut Cursor::new(buf))?)
+        if buf.len() < 56 {
+            return Err(ProtoError::Malformed("CREATE fixed request too short"));
+        }
+        let name_offset = u16::from_le_bytes(buf[44..46].try_into().unwrap()) as usize;
+        let name_length = u16::from_le_bytes(buf[46..48].try_into().unwrap()) as usize;
+        let context_offset = u32::from_le_bytes(buf[48..52].try_into().unwrap()) as usize;
+        let context_length = u32::from_le_bytes(buf[52..56].try_into().unwrap()) as usize;
+        let field = |offset: usize, length: usize| -> ProtoResult<&[u8]> {
+            if length == 0 {
+                return Ok(&[]);
+            }
+            let start = offset
+                .checked_sub(64)
+                .ok_or(ProtoError::Malformed("CREATE offset before header"))?;
+            if start < 56 {
+                return Err(ProtoError::Malformed("CREATE field overlaps fixed request"));
+            }
+            let end = start
+                .checked_add(length)
+                .ok_or(ProtoError::Malformed("CREATE field overflow"))?;
+            buf.get(start..end)
+                .ok_or(ProtoError::Malformed("CREATE field out of range"))
+        };
+        let name = field(name_offset, name_length)?;
+        let contexts = field(context_offset, context_length)?;
+        let mut packed = buf[..56].to_vec();
+        packed.extend_from_slice(name);
+        packed.extend_from_slice(contexts);
+        Ok(Self::read(&mut Cursor::new(packed))?)
     }
     pub fn write_to(&self, out: &mut Vec<u8>) -> ProtoResult<()> {
         let mut c = Cursor::new(Vec::new());
@@ -363,6 +391,47 @@ mod tests {
         let decoded = CreateRequest::parse(&buf).unwrap();
         assert_eq!(decoded, r);
         assert_eq!(decoded.name_str().unwrap(), "dir\\file.txt");
+    }
+
+    #[test]
+    fn request_reads_aligned_aapl_context_at_wire_offset() {
+        let name = utf16le("x");
+        let mut aapl = Vec::new();
+        CreateContext::encode_chain(
+            &[CreateContext {
+                name: b"AAPL".to_vec(),
+                data: vec![
+                    1, 0, 0, 0, 0, 0, 0, 0, 7, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                ],
+            }],
+            &mut aapl,
+        )
+        .unwrap();
+        let request = CreateRequest {
+            structure_size: 57,
+            security_flags: 0,
+            requested_oplock_level: 0,
+            impersonation_level: 2,
+            smb_create_flags: 0,
+            reserved: 0,
+            desired_access: 1,
+            file_attributes: 0,
+            share_access: 7,
+            create_disposition: 1,
+            create_options: 0,
+            name_offset: 120,
+            name_length: name.len() as u16,
+            create_contexts_offset: 128,
+            create_contexts_length: aapl.len() as u32,
+            name: name.clone(),
+            create_contexts: aapl.clone(),
+        };
+        let mut wire = Vec::new();
+        request.write_to(&mut wire).unwrap();
+        wire.splice(56 + name.len()..56 + name.len(), [0; 6]);
+        let parsed = CreateRequest::parse(&wire).unwrap();
+        assert_eq!(parsed.name, name);
+        assert_eq!(parsed.create_contexts, aapl);
     }
 
     #[test]

@@ -94,6 +94,15 @@ pub async fn handle(
                 return HandlerResponse::err(ntstatus::STATUS_INFO_LENGTH_MISMATCH);
             }
             let mut open = open_arc.write().await;
+            if buffer[0] != 0 && !open.delete_access {
+                return HandlerResponse::err(ntstatus::STATUS_ACCESS_DENIED);
+            }
+            let Some(handle) = open.handle.as_ref() else {
+                return HandlerResponse::err(ntstatus::STATUS_FILE_CLOSED);
+            };
+            if let Err(e) = handle.set_delete_on_close(buffer[0] != 0).await {
+                return HandlerResponse::err(e.to_nt_status());
+            }
             open.delete_on_close = buffer[0] != 0;
             Ok(())
         }
@@ -102,6 +111,15 @@ pub async fn handle(
             //   ReplaceIfExists (1) | Reserved (7) | RootDirectory (8) | FileNameLength (4) | FileName...
             if buffer.len() < 20 {
                 return HandlerResponse::err(ntstatus::STATUS_INFO_LENGTH_MISMATCH);
+            }
+            if !open_arc.read().await.delete_access {
+                return HandlerResponse::err(ntstatus::STATUS_ACCESS_DENIED);
+            }
+            if open_arc.read().await.stream_name.is_some() {
+                return HandlerResponse::err(ntstatus::STATUS_NOT_SUPPORTED);
+            }
+            if u64::from_le_bytes(buffer[8..16].try_into().unwrap()) != 0 {
+                return HandlerResponse::err(ntstatus::STATUS_NOT_SUPPORTED);
             }
             let name_len = u32::from_le_bytes(buffer[16..20].try_into().unwrap()) as usize;
             if buffer.len() < 20 + name_len {
@@ -117,7 +135,7 @@ pub async fn handle(
                 Err(_) => return HandlerResponse::err(ntstatus::STATUS_OBJECT_NAME_INVALID),
             };
             let from = open_arc.read().await.last_path.clone();
-            match backend.rename(&from, &new_path).await {
+            match backend.rename(&from, &new_path, buffer[0] != 0).await {
                 Ok(()) => {
                     open_arc.write().await.last_path = new_path;
                     Ok(())
@@ -126,8 +144,7 @@ pub async fn handle(
             }
         }
         ic::FILE_ALLOCATION_INFORMATION => {
-            // We don't preallocate; respond OK.
-            Ok(())
+            return HandlerResponse::err(ntstatus::STATUS_NOT_SUPPORTED);
         }
         _ => return HandlerResponse::err(ntstatus::STATUS_NOT_SUPPORTED),
     };

@@ -19,10 +19,7 @@ const FILE_REMOTE_DEVICE: u32 = 0x0000_0010;
 const FILE_CASE_SENSITIVE_SEARCH: u32 = 0x0000_0001;
 const FILE_CASE_PRESERVED_NAMES: u32 = 0x0000_0002;
 const FILE_UNICODE_ON_DISK: u32 = 0x0000_0004;
-const FILE_PERSISTENT_ACLS: u32 = 0x0000_0008;
-const FILE_FILE_COMPRESSION: u32 = 0x0000_0010;
-const FILE_SUPPORTS_HARD_LINKS: u32 = 0x0040_0000;
-const FILE_SUPPORTS_EXTENDED_ATTRIBUTES: u32 = 0x0080_0000;
+const FILE_NAMED_STREAMS: u32 = 0x0004_0000;
 
 pub async fn handle(
     _server: &Arc<ServerState>,
@@ -83,7 +80,24 @@ pub async fn handle(
                 ic::FILE_NETWORK_OPEN_INFORMATION => {
                     ic::encode_file_network_open_information(&info)
                 }
-                ic::FILE_STREAM_INFORMATION => ic::encode_file_stream_information(&info),
+                ic::FILE_STREAM_INFORMATION => {
+                    let (path, is_stream) = {
+                        let open = open_arc.read().await;
+                        (open.last_path.clone(), open.stream_name.is_some())
+                    };
+                    if is_stream {
+                        return HandlerResponse::err(ntstatus::STATUS_NOT_SUPPORTED);
+                    }
+                    let backend = {
+                        let tree = tree_arc.read().await;
+                        tree.share.backend.clone()
+                    };
+                    let streams = match backend.list_streams(&path).await {
+                        Ok(streams) => streams,
+                        Err(e) => return HandlerResponse::err(e.to_nt_status()),
+                    };
+                    ic::encode_file_stream_information(&info, &streams)
+                }
                 _ => return HandlerResponse::err(ntstatus::STATUS_INVALID_INFO_CLASS),
             }
         }
@@ -106,17 +120,27 @@ pub async fn handle(
                 ic::FS_DEVICE_INFORMATION => {
                     ic::encode_fs_device_information(FILE_DEVICE_DISK, FILE_REMOTE_DEVICE)
                 }
-                ic::FS_ATTRIBUTE_INFORMATION => ic::encode_fs_attribute_information(
-                    FILE_CASE_SENSITIVE_SEARCH
-                        | FILE_CASE_PRESERVED_NAMES
-                        | FILE_UNICODE_ON_DISK
-                        | FILE_PERSISTENT_ACLS
-                        | FILE_FILE_COMPRESSION
-                        | FILE_SUPPORTS_HARD_LINKS
-                        | FILE_SUPPORTS_EXTENDED_ATTRIBUTES,
-                    255,
-                    "NTFS",
-                ),
+                ic::FS_ATTRIBUTE_INFORMATION => {
+                    let caps = {
+                        let tree = tree_arc.read().await;
+                        tree.share.backend.capabilities()
+                    };
+                    ic::encode_fs_attribute_information(
+                        (if caps.case_sensitive {
+                            FILE_CASE_SENSITIVE_SEARCH
+                        } else {
+                            0
+                        }) | FILE_CASE_PRESERVED_NAMES
+                            | FILE_UNICODE_ON_DISK
+                            | if caps.supports_named_streams {
+                                FILE_NAMED_STREAMS
+                            } else {
+                                0
+                            },
+                        255,
+                        "NTFS",
+                    )
+                }
                 ic::FS_FULL_SIZE_INFORMATION => {
                     ic::encode_fs_full_size_information(1u64 << 40, 1u64 << 39, 1u64 << 39, 1, 4096)
                 }

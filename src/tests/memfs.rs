@@ -118,11 +118,11 @@ impl ShareBackend for MemFsBackend {
         Err(SmbError::NotFound)
     }
 
-    async fn rename(&self, from: &SmbPath, to: &SmbPath) -> SmbResult<()> {
+    async fn rename(&self, from: &SmbPath, to: &SmbPath, replace_if_exists: bool) -> SmbResult<()> {
         let kf = key(from);
         let kt = key(to);
         let mut g = self.inner.lock().unwrap();
-        if g.files.contains_key(&kt) || g.dirs.contains_key(&kt) {
+        if !replace_if_exists && (g.files.contains_key(&kt) || g.dirs.contains_key(&kt)) {
             return Err(SmbError::Exists);
         }
         if let Some(data) = g.files.remove(&kf) {
@@ -136,10 +136,20 @@ impl ShareBackend for MemFsBackend {
         Err(SmbError::NotFound)
     }
 
+    async fn list_streams(&self, path: &SmbPath) -> SmbResult<Vec<crate::backend::StreamInfo>> {
+        let g = self.inner.lock().unwrap();
+        if g.files.contains_key(&key(path)) || g.dirs.contains_key(&key(path)) {
+            Ok(Vec::new())
+        } else {
+            Err(SmbError::NotFound)
+        }
+    }
+
     fn capabilities(&self) -> BackendCapabilities {
         BackendCapabilities {
             is_read_only: false,
             case_sensitive: false,
+            supports_named_streams: false,
         }
     }
 }

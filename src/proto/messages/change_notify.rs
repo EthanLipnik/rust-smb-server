@@ -59,6 +59,33 @@ impl ChangeNotifyResponse {
     }
 }
 
+/// Encode FILE_NOTIFY_INFORMATION records with four-byte next-entry alignment.
+pub fn encode_change_events(events: &[crate::backend::ChangeEvent]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for (index, event) in events.iter().enumerate() {
+        let name: Vec<u8> = event
+            .file_name
+            .encode_utf16()
+            .flat_map(u16::to_le_bytes)
+            .collect();
+        let size = 12 + name.len();
+        let aligned = (size + 3) & !3;
+        let next = if index + 1 == events.len() {
+            0
+        } else {
+            aligned as u32
+        };
+        out.extend_from_slice(&next.to_le_bytes());
+        out.extend_from_slice(&event.action.to_le_bytes());
+        out.extend_from_slice(&(name.len() as u32).to_le_bytes());
+        out.extend_from_slice(&name);
+        if next != 0 {
+            out.resize(out.len() + aligned - size, 0);
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -89,5 +116,30 @@ mod tests {
         let mut buf = Vec::new();
         r.write_to(&mut buf).unwrap();
         assert_eq!(ChangeNotifyResponse::parse(&buf).unwrap(), r);
+    }
+
+    #[test]
+    fn event_chain_uses_relative_unicode_names_and_aligned_offsets() {
+        let events = [
+            crate::backend::ChangeEvent {
+                action: 1,
+                file_name: "新.txt".into(),
+            },
+            crate::backend::ChangeEvent {
+                action: 3,
+                file_name: "other".into(),
+            },
+        ];
+        let bytes = encode_change_events(&events);
+        let next = u32::from_le_bytes(bytes[0..4].try_into().unwrap()) as usize;
+        assert_eq!(next % 4, 0);
+        assert_eq!(
+            u32::from_le_bytes(bytes[next..next + 4].try_into().unwrap()),
+            0
+        );
+        assert_eq!(
+            u32::from_le_bytes(bytes[next + 4..next + 8].try_into().unwrap()),
+            3
+        );
     }
 }

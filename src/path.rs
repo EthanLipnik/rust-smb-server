@@ -18,6 +18,46 @@ pub struct SmbPath {
 }
 
 impl SmbPath {
+    /// Parse an SMB CREATE name, separating a named `:$DATA` stream from its file.
+    /// The default `::$DATA` spelling resolves to the unnamed file stream.
+    pub fn from_utf16_with_stream(units: &[u16]) -> SmbResult<(Self, Option<String>)> {
+        let name = decode_utf16_strict(units)?;
+        let last_separator = name.rfind(['\\', '/']).map_or(0, |i| i + 1);
+        let (prefix, last) = name.split_at(last_separator);
+        let Some((file, suffix)) = last.split_once(':') else {
+            return Ok((name.parse()?, None));
+        };
+        let stream = match suffix.split_once(':') {
+            Some((stream, kind))
+                if kind.eq_ignore_ascii_case("$DATA") && suffix.matches(':').count() == 1 =>
+            {
+                stream
+            }
+            Some(_) => return Err(SmbError::NameInvalid),
+            None => suffix,
+        };
+        let path: Self = format!("{prefix}{file}").parse()?;
+        if path.is_root() {
+            return Err(SmbError::NameInvalid);
+        }
+        if stream.is_empty() && suffix == ":$DATA" {
+            return Ok((path, None));
+        }
+        if stream.is_empty() {
+            return Err(SmbError::NameInvalid);
+        }
+        if stream == "."
+            || stream == ".."
+            || stream.chars().any(|ch| {
+                ch == '\0'
+                    || ch.is_control()
+                    || matches!(ch, '\\' | '/' | ':' | '<' | '>' | '"' | '|' | '?' | '*')
+            })
+        {
+            return Err(SmbError::NameInvalid);
+        }
+        Ok((path, Some(stream.to_owned())))
+    }
     /// The share root.
     pub fn root() -> Self {
         Self::default()
@@ -276,5 +316,31 @@ mod tests {
     fn round_trip_via_utf16() {
         let p = SmbPath::from_utf16(&utf16("a\\b")).unwrap();
         assert_eq!(p.components(), &["a", "b"]);
+    }
+
+    #[test]
+    fn named_streams_preserve_apple_names_and_reject_unsafe_syntax() {
+        for stream in ["AFP_AfpInfo", "AFP_Resource", "com.apple.FinderInfo"] {
+            let wire = utf16(&format!("folder\\file:{stream}:$DATA"));
+            let (path, name) = SmbPath::from_utf16_with_stream(&wire).unwrap();
+            assert_eq!(path.display_backslash(), "folder\\file");
+            assert_eq!(name.as_deref(), Some(stream));
+        }
+        let (path, name) = SmbPath::from_utf16_with_stream(&utf16("file::$DATA")).unwrap();
+        assert_eq!(path.display_backslash(), "file");
+        assert_eq!(name, None);
+        let (_, short_name) = SmbPath::from_utf16_with_stream(&utf16("file:AFP_AfpInfo")).unwrap();
+        assert_eq!(short_name.as_deref(), Some("AFP_AfpInfo"));
+        for bad in [
+            "file:",
+            "file:foo:$INDEX_ALLOCATION",
+            "file:../x:$DATA",
+            "file:foo:bar:$DATA",
+        ] {
+            assert!(
+                SmbPath::from_utf16_with_stream(&utf16(bad)).is_err(),
+                "{bad}"
+            );
+        }
     }
 }

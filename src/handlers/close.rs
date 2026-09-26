@@ -4,7 +4,6 @@ use std::sync::Arc;
 
 use crate::proto::header::Smb2Header;
 use crate::proto::messages::{CloseRequest, CloseResponse};
-use tracing::debug;
 
 use crate::conn::state::Connection;
 use crate::dispatch::HandlerResponse;
@@ -38,11 +37,9 @@ pub async fn handle(
         None => return HandlerResponse::err(ntstatus::STATUS_FILE_CLOSED),
     };
 
-    // Pull state out, close the handle, then optionally unlink.
+    // The backend owns delete-pending and applies it on the final close.
     let mut open = open_arc.write().await;
     let handle = open.handle.take();
-    let path = open.last_path.clone();
-    let delete_on_close = open.delete_on_close;
     let want_attrs = req.flags & FLAG_POSTQUERY_ATTRIB != 0;
     drop(open);
 
@@ -57,14 +54,8 @@ pub async fn handle(
         None
     };
     if let Some(h) = handle {
-        let _ = h.close().await;
-    }
-    if delete_on_close {
-        let tree = tree_arc.read().await;
-        let backend = tree.share.backend.clone();
-        drop(tree);
-        if let Err(e) = backend.unlink(&path).await {
-            debug!(error = %e, "delete-on-close unlink failed");
+        if let Err(e) = h.close().await {
+            return HandlerResponse::err(e.to_nt_status());
         }
     }
 

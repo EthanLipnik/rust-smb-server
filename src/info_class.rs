@@ -173,18 +173,41 @@ pub fn encode_file_network_open_information(info: &FileInfo) -> Vec<u8> {
 // stream entry (`::$DATA`); for directories, empty buffer.
 // ---------------------------------------------------------------------------
 
-pub fn encode_file_stream_information(info: &FileInfo) -> Vec<u8> {
+pub fn encode_file_stream_information(
+    info: &FileInfo,
+    streams: &[crate::backend::StreamInfo],
+) -> Vec<u8> {
     if info.is_directory {
         return Vec::new();
     }
-    let stream_name = utf16le("::$DATA");
-    let stream_name_len = stream_name.len() as u32;
     let mut out = Vec::new();
-    out.extend_from_slice(&0u32.to_le_bytes()); // NextEntryOffset = 0
-    out.extend_from_slice(&stream_name_len.to_le_bytes()); // StreamNameLength
-    out.extend_from_slice(&info.end_of_file.to_le_bytes()); // StreamSize
-    out.extend_from_slice(&info.allocation_size.to_le_bytes()); // StreamAllocationSize
-    out.extend_from_slice(&stream_name);
+    let entries = std::iter::once(("::$DATA".to_owned(), info.end_of_file, info.allocation_size))
+        .chain(streams.iter().map(|stream| {
+            (
+                format!(":{}:$DATA", stream.name),
+                stream.size,
+                stream.allocation_size,
+            )
+        }));
+    let entries: Vec<_> = entries.collect();
+    for (index, (name, size, allocation)) in entries.iter().enumerate() {
+        let name_bytes = utf16le(name);
+        let entry_len = 24 + name_bytes.len();
+        let padded_len = (entry_len + 7) & !7;
+        let next = if index + 1 == entries.len() {
+            0
+        } else {
+            padded_len as u32
+        };
+        out.extend_from_slice(&next.to_le_bytes());
+        out.extend_from_slice(&(name_bytes.len() as u32).to_le_bytes());
+        out.extend_from_slice(&size.to_le_bytes());
+        out.extend_from_slice(&allocation.to_le_bytes());
+        out.extend_from_slice(&name_bytes);
+        if next != 0 {
+            out.resize(out.len() + padded_len - entry_len, 0);
+        }
+    }
     out
 }
 
@@ -431,6 +454,32 @@ mod tests {
             is_directory: false,
             file_index: 1,
         }
+    }
+
+    #[test]
+    fn stream_information_chains_aligned_named_entries() {
+        let streams = vec![crate::backend::StreamInfo {
+            name: "AFP_Resource".to_owned(),
+            size: 42,
+            allocation_size: 64,
+        }];
+        let bytes = encode_file_stream_information(&fake_info(), &streams);
+        let next = u32::from_le_bytes(bytes[0..4].try_into().unwrap()) as usize;
+        assert_eq!(next % 8, 0);
+        assert_eq!(
+            u32::from_le_bytes(bytes[next..next + 4].try_into().unwrap()),
+            0
+        );
+        assert_eq!(
+            u64::from_le_bytes(bytes[next + 8..next + 16].try_into().unwrap()),
+            42
+        );
+        let name_len = u32::from_le_bytes(bytes[next + 4..next + 8].try_into().unwrap()) as usize;
+        let name: Vec<u16> = bytes[next + 24..next + 24 + name_len]
+            .chunks_exact(2)
+            .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+            .collect();
+        assert_eq!(String::from_utf16(&name).unwrap(), ":AFP_Resource:$DATA");
     }
 
     #[test]

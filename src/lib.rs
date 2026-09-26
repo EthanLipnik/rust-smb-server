@@ -32,8 +32,8 @@ mod server;
 mod utils;
 
 pub use backend::{
-    BackendCapabilities, DirEntry, FileInfo, FileTimes, Handle, OpenIntent, OpenOptions, RangeLock,
-    RangeLockAction, ShareBackend,
+    BackendCapabilities, ChangeEvent, DirEntry, FileInfo, FileTimes, Handle, OpenIntent,
+    OpenOptions, RangeLock, RangeLockAction, ShareBackend, StreamInfo,
 };
 pub use builder::{Access, Share};
 pub use error::{SmbError, SmbResult};
