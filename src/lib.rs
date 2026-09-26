@@ -31,7 +31,9 @@ mod proto;
 mod server;
 mod utils;
 
-pub use backend::{DirEntry, FileInfo, Handle, OpenIntent, OpenOptions, ShareBackend};
+pub use backend::{
+    DirEntry, FileInfo, Handle, OpenIntent, OpenOptions, RangeLock, RangeLockAction, ShareBackend,
+};
 pub use builder::{Access, Share};
 #[cfg(feature = "localfs")]
 pub use fs::LocalFsBackend;

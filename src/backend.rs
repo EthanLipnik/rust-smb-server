@@ -37,6 +37,10 @@ pub struct OpenOptions {
     pub read: bool,
     /// Write access requested.
     pub write: bool,
+    /// Delete access requested.
+    pub delete: bool,
+    /// FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_SHARE_DELETE bitmask.
+    pub share_access: u32,
     /// CREATE disposition.
     pub intent: OpenIntent,
     /// `FILE_DIRECTORY_FILE` was set on CREATE — open or create a directory.
@@ -47,11 +51,29 @@ pub struct OpenOptions {
     pub delete_on_close: bool,
 }
 
+/// One byte-range operation in an SMB LOCK request. Backends apply all
+/// operations in a request atomically or leave the previous state intact.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RangeLock {
+    pub offset: u64,
+    pub length: u64,
+    pub action: RangeLockAction,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RangeLockAction {
+    Shared,
+    Exclusive,
+    Unlock,
+}
+
 impl Default for OpenOptions {
     fn default() -> Self {
         Self {
             read: true,
             write: false,
+            delete: false,
+            share_access: 0x7,
             intent: OpenIntent::Open,
             directory: false,
             non_directory: false,
@@ -179,6 +201,11 @@ pub trait ShareBackend: Send + Sync + 'static {
 /// session goes away.
 #[async_trait]
 pub trait Handle: Send + Sync {
+    /// Unsupported backends fail closed so the server never acknowledges
+    /// byte-range protection it cannot enforce.
+    async fn lock_ranges(&self, _operations: &[RangeLock]) -> SmbResult<()> {
+        Err(SmbError::NotSupported)
+    }
     /// Read up to `len` bytes at `offset`. May return fewer.
     async fn read(&self, offset: u64, len: u32) -> SmbResult<bytes::Bytes>;
 

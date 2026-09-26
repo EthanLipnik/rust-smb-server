@@ -17,6 +17,7 @@
 
 use std::io;
 use std::os::unix::fs::FileExt as _;
+use std::os::unix::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -24,12 +25,13 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use async_trait::async_trait;
 use bytes::Bytes;
 use cap_std::ambient_authority;
-use cap_std::fs::{Dir, OpenOptions as CapOpenOptions};
+use cap_std::fs::{Dir, MetadataExt as _, OpenOptions as CapOpenOptions};
 use tokio::task::spawn_blocking;
 
+use super::locks::{FileKey, LockOwner};
 use crate::backend::{
     BackendCapabilities, DirEntry as SmbDirEntry, FileInfo, FileTimes, Handle, OpenIntent,
-    OpenOptions, ShareBackend,
+    OpenOptions, RangeLock, ShareBackend,
 };
 use crate::error::{SmbError, SmbResult};
 use crate::path::SmbPath;
@@ -229,6 +231,7 @@ impl ShareBackend for LocalFsBackend {
         //    truncation, or overwrite is rejected up front. Pure read opens
         //    pass through.
         let writes = opts.write
+            || opts.delete
             || matches!(
                 opts.intent,
                 OpenIntent::Create
@@ -276,9 +279,22 @@ impl ShareBackend for LocalFsBackend {
             .map_err(io_to_smb)?
             .map_err(io_to_smb)?;
 
+            let metadata = dir_handle.dir_metadata().map_err(io_to_smb)?;
+            let lock_owner = Arc::new(LockOwner::new(
+                FileKey {
+                    device: metadata.dev(),
+                    inode: metadata.ino(),
+                },
+                opts.read,
+                opts.write,
+                opts.delete,
+                opts.share_access,
+            )?);
+
             return Ok(Box::new(LocalHandle::Dir {
                 name: file_name_for(path),
                 dir_handle: Arc::new(dir_handle),
+                _lock_owner: lock_owner,
             }));
         }
 
@@ -310,9 +326,21 @@ impl ShareBackend for LocalFsBackend {
                         .map_err(join_to_io)
                         .map_err(io_to_smb)?
                         .map_err(io_to_smb)?;
+                    let metadata = dir_handle.dir_metadata().map_err(io_to_smb)?;
+                    let lock_owner = Arc::new(LockOwner::new(
+                        FileKey {
+                            device: metadata.dev(),
+                            inode: metadata.ino(),
+                        },
+                        opts.read,
+                        opts.write,
+                        opts.delete,
+                        opts.share_access,
+                    )?);
                     return Ok(Box::new(LocalHandle::Dir {
                         name: file_name_for(path),
                         dir_handle: Arc::new(dir_handle),
+                        _lock_owner: lock_owner,
                     }));
                 }
                 OpenIntent::Create => return Err(SmbError::Exists),
@@ -332,17 +360,13 @@ impl ShareBackend for LocalFsBackend {
                 cap_opts.read(opts.read).write(true).create_new(true);
             }
             OpenIntent::Truncate => {
-                cap_opts.read(opts.read).write(true).truncate(true);
+                cap_opts.read(opts.read).write(true);
             }
             OpenIntent::OpenOrCreate => {
                 cap_opts.read(opts.read).write(true).create(true);
             }
             OpenIntent::OverwriteOrCreate => {
-                cap_opts
-                    .read(opts.read)
-                    .write(true)
-                    .create(true)
-                    .truncate(true);
+                cap_opts.read(opts.read).write(true).create(true);
             }
         }
 
@@ -357,11 +381,29 @@ impl ShareBackend for LocalFsBackend {
         // `set_times`, `set_len`, `sync_data`, and `FileExt::{read,write}_at`
         // without pulling in extra crates.
         let std_file: std::fs::File = cap_file.into_std();
+        let metadata = std_file.metadata().map_err(io_to_smb)?;
+        let lock_owner = Arc::new(LockOwner::new(
+            FileKey {
+                device: metadata.dev(),
+                inode: metadata.ino(),
+            },
+            opts.read,
+            opts.write,
+            opts.delete,
+            opts.share_access,
+        )?);
+        if matches!(
+            opts.intent,
+            OpenIntent::Truncate | OpenIntent::OverwriteOrCreate
+        ) {
+            std_file.set_len(0).map_err(io_to_smb)?;
+        }
 
         Ok(Box::new(LocalHandle::File {
             name: file_name_for(path),
             file: Arc::new(std_file),
             read_only,
+            lock_owner,
         }))
     }
 
@@ -442,10 +484,12 @@ enum LocalHandle {
         name: String,
         file: Arc<std::fs::File>,
         read_only: bool,
+        lock_owner: Arc<LockOwner>,
     },
     Dir {
         name: String,
         dir_handle: Arc<Dir>,
+        _lock_owner: Arc<LockOwner>,
     },
 }
 
@@ -455,21 +499,32 @@ fn file_name_for(path: &SmbPath) -> String {
 
 #[async_trait]
 impl Handle for LocalHandle {
+    async fn lock_ranges(&self, operations: &[RangeLock]) -> SmbResult<()> {
+        match self {
+            LocalHandle::File { lock_owner, .. } => lock_owner.apply(operations),
+            LocalHandle::Dir { .. } => Err(SmbError::IsDirectory),
+        }
+    }
+
     async fn read(&self, offset: u64, len: u32) -> SmbResult<Bytes> {
         match self {
-            LocalHandle::File { file, .. } => {
+            LocalHandle::File {
+                file, lock_owner, ..
+            } => {
                 let file = Arc::clone(file);
+                let lock_owner = Arc::clone(lock_owner);
                 let n = len as usize;
-                let bytes = spawn_blocking(move || -> io::Result<Bytes> {
-                    let mut buf = vec![0u8; n];
-                    let read = file.read_at(&mut buf, offset)?;
-                    buf.truncate(read);
-                    Ok(Bytes::from(buf))
+                let bytes = spawn_blocking(move || {
+                    lock_owner.with_access(offset, n as u64, false, || {
+                        let mut buf = vec![0u8; n];
+                        let read = file.read_at(&mut buf, offset)?;
+                        buf.truncate(read);
+                        Ok(Bytes::from(buf))
+                    })
                 })
                 .await
                 .map_err(join_to_io)
-                .map_err(io_to_smb)?
-                .map_err(io_to_smb)?;
+                .map_err(io_to_smb)??;
                 Ok(bytes)
             }
             LocalHandle::Dir { .. } => Err(SmbError::IsDirectory),
@@ -483,17 +538,24 @@ impl Handle for LocalHandle {
     async fn write_owned(&self, offset: u64, data: Vec<u8>) -> SmbResult<u32> {
         match self {
             LocalHandle::File {
-                file, read_only, ..
+                file,
+                read_only,
+                lock_owner,
+                ..
             } => {
                 if *read_only {
                     return Err(SmbError::AccessDenied);
                 }
                 let file = Arc::clone(file);
-                let written = spawn_blocking(move || file.write_at(&data, offset))
-                    .await
-                    .map_err(join_to_io)
-                    .map_err(io_to_smb)?
-                    .map_err(io_to_smb)?;
+                let lock_owner = Arc::clone(lock_owner);
+                let written = spawn_blocking(move || {
+                    lock_owner.with_access(offset, data.len() as u64, true, || {
+                        file.write_at(&data, offset)
+                    })
+                })
+                .await
+                .map_err(join_to_io)
+                .map_err(io_to_smb)??;
                 Ok(u32::try_from(written).unwrap_or(u32::MAX))
             }
             LocalHandle::Dir { .. } => Err(SmbError::IsDirectory),
@@ -589,17 +651,22 @@ impl Handle for LocalHandle {
     async fn truncate(&self, len: u64) -> SmbResult<()> {
         match self {
             LocalHandle::File {
-                file, read_only, ..
+                file,
+                read_only,
+                lock_owner,
+                ..
             } => {
                 if *read_only {
                     return Err(SmbError::AccessDenied);
                 }
                 let file = Arc::clone(file);
-                spawn_blocking(move || file.set_len(len))
-                    .await
-                    .map_err(join_to_io)
-                    .map_err(io_to_smb)?
-                    .map_err(io_to_smb)
+                let lock_owner = Arc::clone(lock_owner);
+                spawn_blocking(move || {
+                    lock_owner.with_access(0, u64::MAX, true, || file.set_len(len))
+                })
+                .await
+                .map_err(join_to_io)
+                .map_err(io_to_smb)?
             }
             // Protocol layer rejects truncate on dir handles before this; if
             // it ever reaches us, surface as NotSupported.
@@ -671,6 +738,8 @@ mod tests {
         OpenOptions {
             read: true,
             write: true,
+            delete: false,
+            share_access: 7,
             intent: OpenIntent::Create,
             directory: false,
             non_directory: false,
@@ -682,6 +751,8 @@ mod tests {
         OpenOptions {
             read: true,
             write: true,
+            delete: false,
+            share_access: 7,
             intent: OpenIntent::Open,
             directory: false,
             non_directory: false,
@@ -693,6 +764,8 @@ mod tests {
         OpenOptions {
             read: true,
             write: false,
+            delete: false,
+            share_access: 7,
             intent: OpenIntent::Open,
             directory: false,
             non_directory: false,
@@ -704,6 +777,8 @@ mod tests {
         OpenOptions {
             read: true,
             write: false,
+            delete: false,
+            share_access: 7,
             intent: OpenIntent::Open,
             directory: true,
             non_directory: false,

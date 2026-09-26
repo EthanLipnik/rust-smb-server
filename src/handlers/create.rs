@@ -55,6 +55,9 @@ pub async fn handle(
         Ok(r) => r,
         Err(_) => return HandlerResponse::err(ntstatus::STATUS_INVALID_PARAMETER),
     };
+    if req.share_access & !0x7 != 0 {
+        return HandlerResponse::err(ntstatus::STATUS_INVALID_PARAMETER);
+    }
 
     let tree_arc = match lookup_session_tree(conn, hdr).await {
         Ok(t) => t,
@@ -93,14 +96,14 @@ pub async fn handle(
         & (FILE_WRITE_DATA
             | FILE_APPEND_DATA
             | FILE_WRITE_ATTRIBUTES
-            | DELETE
             | GENERIC_WRITE
             | GENERIC_ALL
             | MAX_ALLOWED)
         != 0;
+    let want_delete = req.desired_access & (DELETE | GENERIC_ALL | MAX_ALLOWED) != 0;
 
     // Reject writes on a read-only tree.
-    if want_write && !granted.allows_write() {
+    if (want_write || want_delete) && !granted.allows_write() {
         warn!(path = %path, "write open on read-only tree");
         return HandlerResponse::err(ntstatus::STATUS_ACCESS_DENIED);
     }
@@ -123,10 +126,15 @@ pub async fn handle(
         return HandlerResponse::err(ntstatus::STATUS_INVALID_PARAMETER);
     }
     let delete_on_close = req.create_options & FILE_DELETE_ON_CLOSE != 0;
+    if delete_on_close && !want_delete {
+        return HandlerResponse::err(ntstatus::STATUS_ACCESS_DENIED);
+    }
 
     let opts = OpenOptions {
-        read: want_read || !want_write,
+        read: want_read || (!want_write && !want_delete),
         write: want_write,
+        delete: want_delete,
+        share_access: req.share_access,
         intent,
         directory,
         non_directory,
@@ -156,7 +164,11 @@ pub async fn handle(
     let open = Open::new(
         file_id,
         handle,
-        if want_write { granted } else { Access::Read },
+        if want_write || want_delete {
+            granted
+        } else {
+            Access::Read
+        },
         path,
         info.is_directory,
         delete_on_close,
