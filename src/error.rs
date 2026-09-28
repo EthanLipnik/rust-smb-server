@@ -27,6 +27,8 @@ pub enum SmbError {
     IsDirectory,
     #[error("not a directory")]
     NotADirectory,
+    #[error("operation crosses filesystem owners")]
+    CrossDevice,
     #[error("name too long / invalid")]
     NameInvalid,
     #[error("sharing violation")]
@@ -52,6 +54,7 @@ impl SmbError {
             SmbError::NotEmpty => ntstatus::STATUS_DIRECTORY_NOT_EMPTY,
             SmbError::IsDirectory => ntstatus::STATUS_FILE_IS_A_DIRECTORY,
             SmbError::NotADirectory => ntstatus::STATUS_NOT_A_DIRECTORY,
+            SmbError::CrossDevice => ntstatus::STATUS_NOT_SAME_DEVICE,
             SmbError::NameInvalid => ntstatus::STATUS_OBJECT_NAME_INVALID,
             SmbError::Sharing => ntstatus::STATUS_SHARING_VIOLATION,
             SmbError::LockConflict => ntstatus::STATUS_FILE_LOCK_CONFLICT,
@@ -77,6 +80,7 @@ mod tests {
         assert_eq!(SmbError::NotADirectory.to_nt_status(), 0xC000_0103);
         assert_eq!(SmbError::NameInvalid.to_nt_status(), 0xC000_0033);
         assert_eq!(SmbError::Sharing.to_nt_status(), 0xC000_0043);
+        assert_eq!(SmbError::CrossDevice.to_nt_status(), 0xC000_00D4);
         assert_eq!(SmbError::NotSupported.to_nt_status(), 0xC000_00BB);
 
         let io_err = SmbError::Io(std::io::Error::other("boom"));
